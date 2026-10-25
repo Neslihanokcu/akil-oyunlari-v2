@@ -74,9 +74,9 @@ esc = html.escape
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 NO_AUTH_MSG = "Bu işlem için yönetici girişi gerekir."
-MAX_PIN_FAILS = 5      # üst üste hatalı PIN sınırı
-LOCK_SECONDS = 300     # kilit süresi (sn)
-PAGE_SIZE = 20         # sayfa başına kayıt
+MAX_PIN_FAILS = 5
+LOCK_SECONDS = 300
+PAGE_SIZE = 20
 
 
 # ----------------------------------------------------------------------------
@@ -127,12 +127,6 @@ def _to_int(v):
         return int(float(v))
     except (TypeError, ValueError):
         return None
-
-
-def prev_school_year():
-    t = date.today()
-    start = t.year if t.month >= 9 else t.year - 1
-    return f"{start - 1}-{start}"
 
 
 def _norm(s):
@@ -303,14 +297,8 @@ def save_to_waitlist(ad_soyad, eposta, kurum):
         )
 
 
-# ---- Yetkilendirme ---------------------------------------------------------
 def is_admin():
     return bool(st.session_state.get("admin"))
-
-
-def require_admin():
-    if not is_admin():
-        raise PermissionError(NO_AUTH_MSG)
 
 
 def admin_logout():
@@ -318,7 +306,6 @@ def admin_logout():
     st.session_state.pop("del_pending", None)
 
 
-# ---- PIN -------------------------------------------------------------------
 def _hash_pin(pin, salt_hex):
     return hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), bytes.fromhex(salt_hex), 120_000).hex()
 
@@ -326,11 +313,6 @@ def _hash_pin(pin, salt_hex):
 def _store_pin(pin):
     salt = secrets.token_hex(16)
     _set_setting("admin_pin", f"{salt}\${_hash_pin(pin, salt)}")
-
-
-def set_pin(pin):
-    require_admin()
-    _store_pin(pin)
 
 
 def verify_pin(pin):
@@ -366,7 +348,6 @@ def reset_pin_failures():
     _set_setting("pin_lock_until", "0")
 
 
-# ---- Öğrenciler ------------------------------------------------------------
 def _sort_students(df):
     if df.empty:
         return df
@@ -392,128 +373,7 @@ def _dup_no_message(no):
     return None
 
 
-def add_student(ogrenci_no, ad_soyad, sinif, sube):
-    if not is_admin():
-        return False, NO_AUTH_MSG
-    ad_soyad = re.sub(r"\s+", " ", ad_soyad).strip()
-    sube = sube.strip().upper()
-    if not ad_soyad or not sube:
-        return False, "Ad Soyad ve Şube boş bırakılamaz."
-    try:
-        with db() as c:
-            cur = c.execute(
-                "INSERT INTO students (ogrenci_no, ad_soyad, sinif, sube) VALUES (?,?,?,?)",
-                (ogrenci_no.strip() or None, ad_soyad, int(sinif), sube),
-            )
-            if not ogrenci_no.strip():
-                c.execute("UPDATE students SET ogrenci_no=? WHERE id=?", (f"OG{cur.lastrowid:04d}", cur.lastrowid))
-        return True, f"{ad_soyad} eklendi."
-    except sqlite3.IntegrityError:
-        return False, _dup_no_message(ogrenci_no.strip()) or "Bu öğrenci numarası zaten kayıtlı."
-
-
-def update_student(sid, ogrenci_no, ad_soyad, sinif, sube):
-    if not is_admin():
-        return False, NO_AUTH_MSG
-    ad_soyad = re.sub(r"\s+", " ", ad_soyad).strip()
-    sube = sube.strip().upper()
-    if not ad_soyad or not sube or not ogrenci_no.strip():
-        return False, "Tüm alanlar doldurulmalıdır."
-    try:
-        with db() as c:
-            c.execute(
-                "UPDATE students SET ogrenci_no=?, ad_soyad=?, sinif=?, sube=? WHERE id=?",
-                (ogrenci_no.strip(), ad_soyad, int(sinif), sube, int(sid)),
-            )
-        return True, "Öğrenci bilgileri güncellendi."
-    except sqlite3.IntegrityError:
-        return False, _dup_no_message(ogrenci_no.strip()) or "Bu öğrenci numarası başka bir öğrenciye ait."
-
-
-def delete_student(sid):
-    require_admin()
-    with db() as c:
-        c.execute("DELETE FROM students WHERE id=?", (int(sid),))
-
-
-# ---- Excel / CSV içe aktarma ------------------------------------------------
-_ALIAS_ID = {"ogrenciid", "ogrencino", "ogrno", "okulno", "no", "id", "numara", "ogrencinumarasi"}
-_ALIAS_NAME = {"adsoyad", "adisoyadi", "adsoyadi", "adisoyad", "isim", "ogrenci", "ogrenciadi", "adivesoyadi",
-               "ogrenciadisoyadi", "ogrenciadsoyad", "ogrenciadsoyadi"}
-_ALIAS_SINIF = {"sinif", "sinifi", "sinifduzeyi", "seviye"}
-_ALIAS_SUBE = {"sube", "subesi"}
-
-
-def _read_uploaded_table(uploaded):
-    name = uploaded.name.lower()
-    data = uploaded.getvalue()
-    raw = None
-    try:
-        if name.endswith(".csv"):
-            for enc in ("utf-8-sig", "cp1254", "latin-1"):
-                try:
-                    raw = pd.read_csv(io.BytesIO(data), sep=None, engine="python", encoding=enc, dtype=str)
-                    break
-                except (UnicodeDecodeError, pd.errors.ParserError):
-                    continue
-        else:
-            raw = pd.read_excel(io.BytesIO(data), dtype=str)
-    except Exception as e:
-        raise ValueError(f"Dosya okunamadı: {e}")
-    if raw is None or raw.empty:
-        raise ValueError("Dosya boş veya okunamadı.")
-    return raw
-
-
-def parse_student_file(uploaded):
-    raw = _read_uploaded_table(uploaded)
-    cols = {}
-    for col in raw.columns:
-        n = _norm(col)
-        for key, alias in (("id", _ALIAS_ID), ("name", _ALIAS_NAME), ("sinif", _ALIAS_SINIF), ("sube", _ALIAS_SUBE)):
-            if n in alias and key not in cols:
-                cols[key] = col
-    missing = [lbl for k, lbl in (("name", "Ad_Soyad"), ("sinif", "Sınıf"), ("sube", "Şube")) if k not in cols]
-    if missing:
-        raise ValueError(
-            "Gerekli sütun(lar) bulunamadı: " + ", ".join(missing)
-            + f". Dosyadaki sütunlar: {', '.join(map(str, raw.columns))}"
-        )
-
-    out = pd.DataFrame()
-    out["ad_soyad"] = raw[cols["name"]].fillna("").astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
-    out["sinif"] = pd.to_numeric(raw[cols["sinif"]].astype(str).str.extract(r"(\d+)")[0], errors="coerce")
-    out["sube"] = raw[cols["sube"]].fillna("").astype(str).str.strip().map(tr_upper)
-    if "id" in cols:
-        out["ogrenci_no"] = raw[cols["id"]].fillna("").astype(str).str.strip().replace("nan", "")
-    else:
-        out["ogrenci_no"] = ""
-
-    notes = []
-    total = len(out)
-    valid = (out.ad_soyad != "") & out.sinif.notna() & (out.sube != "")
-    if (~valid).sum():
-        notes.append(f"{int((~valid).sum())} satır eksik bilgi nedeniyle atlandı.")
-    out = out[valid].copy()
-    out["sinif"] = out.sinif.astype(int)
-    out = out[["ogrenci_no", "ad_soyad", "sinif", "sube"]]
-
-    before = len(out)
-    has_id = out.ogrenci_no != ""
-    dup_id = out[has_id].duplicated("ogrenci_no", keep="first")
-    out = out.drop(index=dup_id[dup_id].index)
-    out = out.drop_duplicates(subset=["ad_soyad", "sinif", "sube"], keep="first")
-    if before - len(out):
-        notes.append(f"{before - len(out)} tekrar eden satır birleştirildi.")
-    if "id" not in cols:
-        notes.append("Dosyada öğrenci numarası sütunu yok; numaralar otomatik üretilecek (OG0001, OG0002...).")
-    if total and out.empty:
-        raise ValueError("Geçerli öğrenci satırı bulunamadı.")
-    return out.reset_index(drop=True), notes
-
-
 def import_students(df, replace=False):
-    require_admin()
     added = updated = skipped = arch = 0
     with db() as c:
         if replace:
@@ -553,33 +413,11 @@ def import_students(df, replace=False):
     return added, updated, skipped, arch
 
 
-# ---- Oyunlar ---------------------------------------------------------------
 def load_games():
     with db() as c:
         return pd.read_sql_query("SELECT id, ad, kategori, varsayilan FROM games ORDER BY kategori, id", c)
 
 
-def add_game(ad, kategori):
-    if not is_admin():
-        return False, NO_AUTH_MSG
-    ad = ad.strip()
-    if not ad:
-        return False, "Oyun adı boş olamaz."
-    try:
-        with db() as c:
-            c.execute("INSERT INTO games (ad, kategori, varsayilan) VALUES (?,?,0)", (ad, kategori))
-        return True, f"'{ad}' kütüphaneye eklendi."
-    except sqlite3.IntegrityError:
-        return False, "Bu isimde bir oyun zaten var."
-
-
-def delete_game(gid):
-    require_admin()
-    with db() as c:
-        c.execute("DELETE FROM games WHERE id=? AND varsayilan=0", (int(gid),))
-
-
-# ---- Maçlar ----------------------------------------------------------------
 def add_match(game_id, p1, p2, sonuc, tarih=None):
     if game_id is None:
         return False, "Lütfen bir oyun seçin."
@@ -605,26 +443,6 @@ def add_match(game_id, p1, p2, sonuc, tarih=None):
     return True, "Maç kaydedildi."
 
 
-def fmt_tarih(v):
-    try:
-        return datetime.strptime(str(v)[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
-    except (ValueError, TypeError):
-        return str(v) if v else "—"
-
-
-def delete_match(mid):
-    require_admin()
-    with db() as c:
-        cur = c.execute("DELETE FROM matches WHERE id=?", (int(mid),))
-        return cur.rowcount > 0
-
-
-def delete_all_matches():
-    require_admin()
-    with db() as c:
-        c.execute("DELETE FROM matches")
-
-
 def load_matches(game_id=None, active_only=False):
     sql = "SELECT id, tarih, game_id, p1_id, p2_id, sonuc FROM matches"
     conds, params = [], []
@@ -639,63 +457,9 @@ def load_matches(game_id=None, active_only=False):
         return pd.read_sql_query(sql + " ORDER BY id DESC", c, params=params)
 
 
-def match_history(game_id=None, newest_first=True, include_archived=False):
-    sql = (
-        "SELECT m.id AS id, m.tarih AS tarih, g.ad AS oyun, "
-        "s1.ad_soyad || CASE WHEN s1.arsiv=1 THEN ' (arşiv)' ELSE '' END AS oyuncu1, "
-        "(s1.sinif || '-' || s1.sube) AS sube1, "
-        "s2.ad_soyad || CASE WHEN s2.arsiv=1 THEN ' (arşiv)' ELSE '' END AS oyuncu2, "
-        "(s2.sinif || '-' || s2.sube) AS sube2, m.sonuc AS sonuc "
-        "FROM matches m JOIN games g ON g.id=m.game_id "
-        "JOIN students s1 ON s1.id=m.p1_id JOIN students s2 ON s2.id=m.p2_id"
-    )
-    conds, params = [], []
-    if game_id is not None:
-        conds.append("m.game_id=?")
-        params.append(int(game_id))
-    if not include_archived:
-        conds.append("(s1.arsiv=0 OR s2.arsiv=0)")
-    if conds:
-        sql += " WHERE " + " AND ".join(conds)
-    direction = "DESC" if newest_first else "ASC"
-    with db() as c:
-        return pd.read_sql_query(
-            sql + f" ORDER BY substr(m.tarih, 1, 10) {direction}, m.id {direction}", c, params=params
-        )
-
-
 def played_pairs(game_id):
     m = load_matches(game_id)
     return {frozenset((int(a), int(b))) for a, b in zip(m.p1_id, m.p2_id)}
-
-
-# ---- Arşiv -----------------------------------------------------------------
-def archive_students(ids, note=""):
-    require_admin()
-    ids = sorted({int(i) for i in ids})
-    if not ids:
-        return 0
-    stamp = date.today().strftime("%Y-%m-%d")
-    note = (note or "").strip() or None
-    with db() as c:
-        cur = c.executemany(
-            "UPDATE students SET arsiv=1, arsiv_tarih=?, arsiv_notu=? WHERE id=? AND arsiv=0",
-            [(stamp, note, i) for i in ids],
-        )
-        return cur.rowcount
-
-
-def restore_students(ids):
-    require_admin()
-    ids = sorted({int(i) for i in ids})
-    if not ids:
-        return 0
-    with db() as c:
-        cur = c.executemany(
-            "UPDATE students SET arsiv=0, arsiv_tarih=NULL, arsiv_notu=NULL WHERE id=? AND arsiv=1",
-            [(i,) for i in ids],
-        )
-        return cur.rowcount
 
 
 def count_archived():
@@ -703,377 +467,6 @@ def count_archived():
         return int(c.execute("SELECT COUNT(*) FROM students WHERE arsiv=1").fetchone()[0])
 
 
-def archived_data_summary():
-    with db() as c:
-        return pd.read_sql_query(
-            "SELECT s.id AS id, "
-            "(SELECT COUNT(*) FROM matches m WHERE m.p1_id=s.id OR m.p2_id=s.id) AS mac, "
-            "(SELECT COUNT(*) FROM progress p WHERE p.student_id=s.id) AS ilerleme, "
-            "(SELECT COUNT(*) FROM group_scores g WHERE g.student_id=s.id) AS grup_skoru "
-            "FROM students s WHERE s.arsiv=1", c,
-        )
-
-
-# ---- Bireysel oyun ilerlemesi -----------------------------------
-def save_progress(student_id, game_id, kart, seviye, tarih=None, kaynak="manuel", donem=None):
-    kart, seviye = _to_int(kart), _nz(seviye)
-    if kart is not None and kart < 0:
-        return False, "Kart sayısı negatif olamaz."
-    if tarih is None:
-        tarih = date.today()
-    if isinstance(tarih, datetime):
-        tarih = tarih.date()
-    if not isinstance(tarih, date):
-        return False, "Geçerli bir tarih seçin."
-    if tarih > date.today():
-        return False, "Tarih bugünden sonra olamaz."
-    with db() as c:
-        c.execute(
-            "INSERT INTO progress (student_id, game_id, kart, seviye, tarih, kaynak, donem) VALUES (?,?,?,?,?,?,?)",
-            (int(student_id), int(game_id), kart, str(seviye) if seviye is not None else None,
-             tarih.strftime("%Y-%m-%d"), kaynak, donem),
-        )
-    return True, "Kaydedildi."
-
-
-def load_progress(game_id=None, student_id=None):
-    sql = (
-        "SELECT p.id AS id, p.student_id AS student_id, p.game_id AS game_id, g.ad AS oyun, g.kategori AS kategori, "
-        "p.kart AS kart, p.seviye AS seviye, p.tarih AS tarih, p.kaynak AS kaynak, p.donem AS donem "
-        "FROM progress p JOIN games g ON g.id=p.game_id"
-    )
-    conds, params = [], []
-    if game_id is not None:
-        conds.append("p.game_id=?")
-        params.append(int(game_id))
-    if student_id is not None:
-        conds.append("p.student_id=?")
-        params.append(int(student_id))
-    if conds:
-        sql += " WHERE " + " AND ".join(conds)
-    with db() as c:
-        return pd.read_sql_query(sql, c, params=params)
-
-
-def latest_progress(df):
-    if df.empty:
-        return df
-    d = df.sort_values(["tarih", "id"], ascending=[False, False])
-    return d.drop_duplicates(["student_id", "game_id"], keep="first").reset_index(drop=True)
-
-
-def import_progress(records, tarih, donem):
-    require_admin()
-    if isinstance(tarih, datetime):
-        tarih = tarih.date()
-    stamp = tarih.strftime("%Y-%m-%d")
-    n = 0
-    with db() as c:
-        for r in records:
-            c.execute(
-                "DELETE FROM progress WHERE student_id=? AND game_id=? AND kaynak='gecis' AND COALESCE(donem,'')=?",
-                (r["student_id"], r["game_id"], donem or ""),
-            )
-            c.execute(
-                "INSERT INTO progress (student_id, game_id, kart, seviye, tarih, kaynak, donem) "
-                "VALUES (?,?,?,?,?, 'gecis', ?)",
-                (r["student_id"], r["game_id"], r["kart"], r["seviye"], stamp, donem or ""),
-            )
-            n += 1
-    return n
-
-
-_ALIAS_TIME = {"zamandamgasi", "tarih", "zaman", "timestamp"}
-
-
-def read_progress_file(uploaded):
-    raw = _read_uploaded_table(uploaded)
-    cols = {}
-    for col in raw.columns:
-        n = _norm(col)
-        for key, alias in (("id", _ALIAS_ID), ("name", _ALIAS_NAME), ("time", _ALIAS_TIME)):
-            if n in alias and key not in cols:
-                cols[key] = col
-    if "id" not in cols and "name" not in cols:
-        raise ValueError(
-            "Öğrenciyi belirleyecek sütun bulunamadı: dosyada Ogrenci_ID (veya Ad_Soyad) sütunu olmalıdır."
-        )
-    return raw, cols
-
-
-def auto_map_columns(raw, cols, games):
-    keyed = set(cols.values())
-    gkeys = [(int(r.id), _norm(r.ad)) for r in games.itertuples()]
-    out = {}
-    for col in raw.columns:
-        if col in keyed:
-            continue
-        n = _norm(col)
-        out[col] = [gid for gid, gk in gkeys if gk and gk in n]
-    return out
-
-
-def _norm_no(v):
-    s = "" if v is None else str(v).strip()
-    if s.lower() in ("nan", "none"):
-        return ""
-    if re.fullmatch(r"\d+\.0+", s):
-        s = s.split(".")[0]
-    return s.upper()
-
-
-def _norm_name(s):
-    return re.sub(r"\s+", " ", tr_upper(str(s))).strip()
-
-
-def build_progress_records(raw, cols, mapping):
-    all_st = load_students("tumu")
-    no_map, name_map, info, arch = {}, {}, {}, set()
-    for r in all_st.itertuples():
-        sid = int(r.id)
-        if r.ogrenci_no:
-            no_map[_norm_no(r.ogrenci_no)] = sid
-        name_map.setdefault(_norm_name(r.ad_soyad), []).append(sid)
-        info[sid] = (r.ad_soyad, f"{r.sinif}-{r.sube}" + (" (arşiv)" if int(r.arsiv) else ""))
-        if int(r.arsiv):
-            arch.add(sid)
-    id_col, name_col, time_col = cols.get("id"), cols.get("name"), cols.get("time")
-    ts = pd.to_datetime(raw[time_col], errors="coerce") if time_col else None
-
-    row_sid, unmatched, blank = {}, [], 0
-    for idx in raw.index:
-        raw_id = _norm_no(raw.at[idx, id_col]) if id_col else ""
-        raw_name = _nz(raw.at[idx, name_col]) if name_col else None
-        if not raw_id and not raw_name:
-            blank += 1
-            continue
-        sid = no_map.get(raw_id) if raw_id else None
-        if sid is None and raw_name:
-            cand = name_map.get(_norm_name(raw_name), [])
-            if len(cand) == 1:
-                sid = cand[0]
-        if sid is None:
-            unmatched.append(f"{raw_id or '—'} · {raw_name or '—'}")
-        else:
-            row_sid[idx] = sid
-
-    order = list(row_sid.keys())
-    if ts is not None:
-        order.sort(key=lambda i: ts.at[i] if pd.notna(ts.at[i]) else pd.Timestamp.min)
-    final, dup = {}, 0
-    for i in order:
-        if row_sid[i] in final:
-            dup += 1
-        final[row_sid[i]] = i
-
-    recs = {}
-    for sid, i in final.items():
-        for col, gids in mapping.items():
-            v = _nz(raw.at[i, col])
-            if v is None or str(v).strip().lower() in ("nan", "none", "-"):
-                continue
-            s = str(v).strip()
-            kart = seviye = None
-            try:
-                f = float(s.replace(",", "."))
-                if f >= 0 and f == int(f):
-                    kart = int(f)
-                else:
-                    seviye = s
-            except (ValueError, OverflowError):
-                seviye = s
-            for gid in gids:
-                d = recs.setdefault((sid, int(gid)), {"kart": None, "seviye": None})
-                if kart is not None and d["kart"] is None:
-                    d["kart"] = kart
-                if seviye is not None and d["seviye"] is None:
-                    d["seviye"] = seviye
-    records = [{"student_id": s, "game_id": g, **d} for (s, g), d in recs.items()]
-    return records, {
-        "matched": len(final), "unmatched": unmatched, "dup": dup, "blank": blank,
-        "archived": len([s for s in final if s in arch]), "info": info,
-        "ts_max": (ts.max().date() if ts is not None and ts.notna().any() else None),
-    }
-
-
-def progress_template_xlsx():
-    games = load_games()
-    indiv = games[games.kategori == INDIV_CATEGORY].ad.tolist()
-    example = pd.DataFrame(
-        [["OG0001", "Örnek Öğrenci 1"] + [20 + 5 * i for i in range(len(indiv))],
-         ["OG0002", "Örnek Öğrenci 2"] + [10 + 3 * i for i in range(len(indiv))]],
-        columns=["Ogrenci_ID", "Ad_Soyad"] + indiv,
-    )
-    help_df = pd.DataFrame({"Açıklama": [
-        "Ogrenci_ID sütunu zorunludur. Ad_Soyad isteğe bağlıdır.",
-        "Her oyun ayrı bir sütundur.",
-    ]})
-    return to_xlsx_bytes({"Geçiş Verisi": example, "Açıklama": help_df})
-
-
-# ---- Toplu oyunlar: grup / turnuva / skor ----------------------------------------
-def _clean(s):
-    return re.sub(r"\s+", " ", s or "").strip()
-
-
-def _as_date(tarih):
-    if tarih is None:
-        return date.today()
-    if isinstance(tarih, datetime):
-        return tarih.date()
-    return tarih if isinstance(tarih, date) else None
-
-
-def create_group(ad, game_id, turnuva, member_ids, tarih=None):
-    ad, turnuva = _clean(ad), _clean(turnuva)
-    if game_id is None:
-        return False, "Lütfen bir toplu oyun seçin."
-    if not ad:
-        return False, "Grup adı boş bırakılamaz."
-    member_ids = sorted({int(i) for i in (member_ids or [])})
-    if not member_ids:
-        return False, "Gruba en az bir oyuncu ekleyin."
-    tarih = _as_date(tarih)
-    if tarih is None or tarih > date.today():
-        return False, "Geçerli bir tarih seçin."
-    try:
-        with db() as c:
-            kat = c.execute("SELECT kategori FROM games WHERE id=?", (int(game_id),)).fetchone()
-            if not kat or kat["kategori"] != GROUP_CATEGORY:
-                return False, "Gruplar yalnızca toplu oyunlar için oluşturulabilir."
-            cur = c.execute(
-                "INSERT INTO game_groups (ad, game_id, turnuva, tarih) VALUES (?,?,?,?)",
-                (ad, int(game_id), turnuva, tarih.strftime("%Y-%m-%d")),
-            )
-            c.executemany(
-                "INSERT OR IGNORE INTO group_members (group_id, student_id) VALUES (?,?)",
-                [(cur.lastrowid, i) for i in member_ids],
-            )
-        return True, f"'{ad}' grubu {len(member_ids)} oyuncu ile oluşturuldu."
-    except sqlite3.IntegrityError:
-        return False, "Bu oyunda, aynı turnuva altında bu isimde bir grup zaten var."
-
-
-def update_group(gid, ad, turnuva, member_ids):
-    ad, turnuva = _clean(ad), _clean(turnuva)
-    if not ad:
-        return False, "Grup adı boş bırakılamaz."
-    want = {int(i) for i in (member_ids or [])}
-    try:
-        with db() as c:
-            c.execute("UPDATE game_groups SET ad=?, turnuva=? WHERE id=?", (ad, turnuva, int(gid)))
-            current = {r[0] for r in c.execute("SELECT student_id FROM group_members WHERE group_id=?", (int(gid),))}
-            active = {r[0] for r in c.execute(
-                "SELECT s.id FROM group_members gm JOIN students s ON s.id=gm.student_id "
-                "WHERE gm.group_id=? AND s.arsiv=0", (int(gid),))}
-            c.executemany("DELETE FROM group_members WHERE group_id=? AND student_id=?",
-                          [(int(gid), i) for i in active - want])
-            c.executemany("INSERT OR IGNORE INTO group_members (group_id, student_id) VALUES (?,?)",
-                          [(int(gid), i) for i in want - current])
-        return True, "Grup güncellendi."
-    except sqlite3.IntegrityError:
-        return False, "Bu oyunda, aynı turnuva altında bu isimde başka bir grup zaten var."
-
-
-def delete_group(gid):
-    require_admin()
-    with db() as c:
-        c.execute("DELETE FROM game_groups WHERE id=?", (int(gid),))
-
-
-def load_groups():
-    with db() as c:
-        return pd.read_sql_query(
-            "SELECT gg.id AS id, gg.ad AS ad, gg.turnuva AS turnuva, gg.tarih AS tarih, gg.game_id AS game_id, "
-            "g.ad AS oyun, "
-            "(SELECT COUNT(*) FROM group_members gm JOIN students s ON s.id=gm.student_id "
-            " WHERE gm.group_id=gg.id AND s.arsiv=0) AS uye "
-            "FROM game_groups gg JOIN games g ON g.id=gg.game_id ORDER BY gg.tarih DESC, gg.id DESC", c)
-
-
-def group_label(r):
-    return f"{r.oyun} · " + (f"{r.turnuva} · " if r.turnuva else "") + f"{r.ad}"
-
-
-def group_members_df(gid):
-    with db() as c:
-        df = pd.read_sql_query(
-            "SELECT s.id AS id, s.ogrenci_no AS ogrenci_no, s.ad_soyad AS ad_soyad, s.sinif AS sinif, s.sube AS sube "
-            "FROM group_members gm JOIN students s ON s.id=gm.student_id "
-            "WHERE gm.group_id=? AND s.arsiv=0", c, params=[int(gid)])
-    return _sort_students(df)
-
-
-def save_group_scores(gid, rows, tarih=None, tur=""):
-    tarih = _as_date(tarih)
-    if tarih is None or tarih > date.today():
-        return False, "Geçerli bir tarih seçin."
-    clean = []
-    for sid, kart, puan in rows:
-        k, p = _to_int(kart), _to_int(puan)
-        if k is None and p is None:
-            continue
-        if (k or 0) < 0 or (p or 0) < 0:
-            return False, "Kart ve puan negatif olamaz."
-        clean.append((int(sid), k or 0, p or 0))
-    if not clean:
-        return False, "Kaydedilecek skor girilmedi."
-    with db() as c:
-        members = {r[0] for r in c.execute("SELECT student_id FROM group_members WHERE group_id=?", (int(gid),))}
-        if any(s not in members for s, _, _ in clean):
-            return False, "Skor girilen oyunculardan biri bu grubun üyesi değil."
-        c.executemany(
-            "INSERT INTO group_scores (group_id, student_id, tarih, tur, kart, puan) VALUES (?,?,?,?,?,?)",
-            [(int(gid), s, tarih.strftime("%Y-%m-%d"), _clean(tur), k, p) for s, k, p in clean],
-        )
-    return True, f"{len(clean)} oyuncunun skoru kaydedildi."
-
-
-def delete_group_score(sid):
-    require_admin()
-    with db() as c:
-        c.execute("DELETE FROM group_scores WHERE id=?", (int(sid),))
-
-
-def group_scores_df():
-    with db() as c:
-        return pd.read_sql_query(
-            "SELECT sc.id AS id, sc.tarih AS tarih, sc.tur AS tur, sc.kart AS kart, sc.puan AS puan, "
-            "sc.student_id AS student_id, sc.group_id AS group_id, gg.ad AS grup, gg.turnuva AS turnuva, "
-            "gg.game_id AS game_id, g.ad AS oyun, s.ad_soyad AS ad_soyad, s.sinif AS sinif, s.sube AS sube, "
-            "s.arsiv AS arsiv "
-            "FROM group_scores sc JOIN game_groups gg ON gg.id=sc.group_id JOIN games g ON g.id=gg.game_id "
-            "JOIN students s ON s.id=sc.student_id ORDER BY sc.tarih DESC, sc.id DESC", c)
-
-
-def player_standings(sc, key="puan"):
-    cols = ["Sıra", "Ad Soyad", "Sınıf", "Şube", "Kayıt", "Kart", "Puan"]
-    if sc.empty:
-        return pd.DataFrame(columns=cols)
-    g = sc.groupby(["student_id", "ad_soyad", "sinif", "sube"], as_index=False).agg(
-        kayit=("id", "count"), kart=("kart", "sum"), puan=("puan", "sum"))
-    other = "kart" if key == "puan" else "puan"
-    g = g.sort_values([key, other, "ad_soyad"], ascending=[False, False, True]).reset_index(drop=True)
-    g.insert(0, "Sıra", range(1, len(g) + 1))
-    return g.rename(columns={"ad_soyad": "Ad Soyad", "sinif": "Sınıf", "sube": "Şube", "kayit": "Kayıt",
-                             "kart": "Kart", "puan": "Puan"})[cols]
-
-
-def group_totals(sc, key="puan"):
-    cols = ["Sıra", "Oyun", "Turnuva", "Grup", "Oyuncu", "Kart", "Puan"]
-    if sc.empty:
-        return pd.DataFrame(columns=cols)
-    g = sc.groupby(["group_id", "oyun", "turnuva", "grup"], as_index=False).agg(
-        oyuncu=("student_id", "nunique"), kart=("kart", "sum"), puan=("puan", "sum"))
-    other = "kart" if key == "puan" else "puan"
-    g = g.sort_values([key, other], ascending=False).reset_index(drop=True)
-    g.insert(0, "Sıra", range(1, len(g) + 1))
-    g["turnuva"] = g.turnuva.replace("", "—")
-    return g.rename(columns={"oyun": "Oyun", "turnuva": "Turnuva", "grup": "Grup", "oyuncu": "Oyuncu",
-                             "kart": "Kart", "puan": "Puan"})[cols]
-
-
-# ---- İstatistikler ---------------------------------------------------------
 def compute_stats(students, matches):
     df = students.copy()
     cols = ["galibiyet", "beraberlik", "maglubiyet"]
@@ -1136,7 +529,7 @@ def auto_pair(ids, rating, already):
 
 
 # ----------------------------------------------------------------------------
-# İKONLAR
+# İKONLAR & TASARIM (CSS)
 # ----------------------------------------------------------------------------
 _ICON_PATHS = {
     "home": '<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>',
@@ -1174,9 +567,6 @@ def _ico(x, size=22):
     return icon(name, size) if name in _ICON_PATHS else x
 
 
-# ----------------------------------------------------------------------------
-# TASARIM (Clean Light & Modern Dark Hero Mix)
-# ----------------------------------------------------------------------------
 CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Nunito:wght@400;600;700;800&display=swap');
@@ -1194,7 +584,6 @@ header[data-testid="stHeader"]{background:transparent;}
 h1,h2,h3,h4{font-family:'DM Serif Display',Georgia,serif !important;color:var(--espresso) !important;letter-spacing:.2px;}
 hr{border-color:var(--line);}
 
-/* ============ LANDING PAGE HERO (Koyu / Modern SaaS Stili) ============ */
 .hero-landing {
   background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%);
   border-radius: 20px;
@@ -1232,7 +621,6 @@ hr{border-color:var(--line);}
   border: 1px solid rgba(16, 185, 129, 0.3);
 }
 
-/* ============ SIDEBAR ============ */
 section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div{background:var(--side) !important;}
 section[data-testid="stSidebar"]{border-right:none;}
 section[data-testid="stSidebar"] .block-container{padding-top:1.5rem;}
@@ -1255,7 +643,137 @@ section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checke
 section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) div{color:#FFFFFF !important;}
 section[data-testid="stSidebar"] .side-note{margin-top:1.4rem;padding:.75rem .95rem;border-radius:10px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);font-size:.8rem;color:#D1D5DB;}
 
-/* ============ BANNER & METRİKLER ============ */
 .welcome{position:relative;overflow:hidden;display:flex;align-items:center;justify-content:space-between;gap:1.2rem;padding:2rem 2.2rem;margin-bottom:1.3rem;border-radius:16px;background:#FFFFFF;border:1px solid var(--line);box-shadow:var(--shadow);}
 .welcome-t{font-family:'DM Serif Display',Georgia,serif;font-size:2.15rem;line-height:1.15;color:var(--espresso);}
-.welcome-s{
+.welcome-s{margin-top:.5rem;font-size:1.02rem;color:var(--muted);max-width:560px;}
+
+.stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:1.1rem 1.25rem;box-shadow:var(--shadow);transition:transform .2s ease, box-shadow .2s ease;height:100%;}
+.stat:hover{transform:translateY(-2px);box-shadow:var(--shadow-h);}
+.stat-top{display:flex;align-items:center;justify-content:space-between;gap:.5rem;}
+.stat-label{font-size:.74rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:700;}
+.stat-icon{width:32px;height:32px;border-radius:9px;background:var(--milk);display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0;}
+.stat-val{font-size:2.3rem;font-weight:800;color:var(--espresso);line-height:1.1;margin-top:.55rem;}
+.stat-sub{font-size:.78rem;color:var(--muted);margin-top:.3rem;}
+
+[data-testid\$="olumn"]:has(.qa-body){position:relative;box-sizing:border-box;background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:1.2rem 1.3rem !important;cursor:pointer;transition:transform .2s ease, box-shadow .2s ease, border-color .2s ease;}
+[data-testid\$="olumn"]:has(.qa-body):hover{transform:translateY(-2px);box-shadow:var(--shadow-h);border-color:var(--taba);}
+[data-testid\$="olumn"]:has(.qa-body) .element-container:has(.stButton),
+[data-testid\$="olumn"]:has(.qa-body) [data-testid="stElementContainer"]:has(.stButton){position:absolute;inset:0;width:100% !important;height:100%;margin:0;z-index:3;}
+[data-testid\$="olumn"]:has(.qa-body) .stButton{width:100%;height:100%;}
+[data-testid\$="olumn"]:has(.qa-body) .stButton > button{width:100%;height:100%;min-height:0;opacity:0;cursor:pointer;border-radius:14px;}
+.qa-body{display:flex;align-items:center;gap:1rem;min-height:74px;}
+.qa-ico{width:52px;height:52px;border-radius:12px;background:var(--milk);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;font-size:1.55rem;flex-shrink:0;}
+.qa-t{font-weight:800;font-size:1.05rem;color:var(--espresso);}
+.qa-d{font-size:.85rem;color:var(--muted);margin-top:.15rem;line-height:1.35;}
+.qa-go{font-size:1.25rem;color:var(--taba);font-weight:800;}
+
+.stButton > button, .stDownloadButton > button, [data-testid="stFormSubmitButton"] > button{border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--espresso);font-weight:700;transition:all .2s ease;}
+.stButton > button:hover, .stDownloadButton > button:hover, [data-testid="stFormSubmitButton"] > button:hover{border-color:var(--taba);color:var(--taba-d);transform:translateY(-1px);box-shadow:0 6px 14px rgba(0,0,0,.06);}
+.stButton > button[kind="primary"], [data-testid="stBaseButton-primary"], [data-testid="stFormSubmitButton"] > button[kind="primary"], [data-testid="stBaseButton-primaryFormSubmit"]{background:linear-gradient(135deg,#10B981,#059669) !important;color:#FFFFFF !important;border:none !important;}
+
+.kvkk-footer {
+  text-align: center;
+  padding: 1.5rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  border-top: 1px solid var(--line);
+  margin-top: 3rem;
+}
+</style>
+"""
+
+
+def inject_css():
+    st.markdown(CSS, unsafe_allow_html=True)
+
+
+def hero(title, subtitle, icon_name):
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:1rem;margin-bottom:1.5rem;">'
+        f'<div style="font-size:2rem;">{_ico(icon_name, 32)}</div>'
+        f'<div><h2 style="margin:0;">{esc(title)}</h2><p style="margin:0;color:var(--muted);">{esc(subtitle)}</p></div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def welcome_banner():
+    st.markdown(
+        '<div class="welcome"><div class="welcome-main">'
+        '<div class="welcome-eyebrow" style="color:#10B981;font-weight:800;letter-spacing:.1em;text-transform:uppercase;font-size:.75rem">Akıl ve Zeka Oyunları · Operasyon Paneli</div>'
+        '<div class="welcome-t">Günaydın, Öğretmenim</div>'
+        '<div class="welcome-s">Şubelerinizdeki turnuva akışını ve öğrencilerin kişisel gelişim süreçlerini tek platformda izleyin.</div>'
+        '</div><div class="welcome-art" style="font-size:2.5rem">' + icon("puzzle", 54) + icon("dice", 54) + '</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def stat_cards(items):
+    cols = st.columns(len(items))
+    for col, item in zip(cols, items):
+        icon_name, label, value = item[0], item[1], item[2]
+        sub = item[3] if len(item) > 3 else ""
+        col.markdown(
+            f'<div class="stat"><div class="stat-top"><div class="stat-label">{esc(label)}</div>'
+            f'<div class="stat-icon">{_ico(icon_name, 18)}</div></div>'
+            f'<div class="stat-val">{esc(str(value))}</div>'
+            + (f'<div class="stat-sub">{esc(sub)}</div>' if sub else "")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+
+def goto(page, match_tab=None):
+    st.session_state["nav"] = page
+    if match_tab:
+        st.session_state["match_tab"] = match_tab
+
+
+def reset_match_tab():
+    st.session_state["match_tab"] = "manual"
+
+
+def quick_action(col, key, icon_name, title, desc, page, match_tab=None):
+    with col:
+        st.markdown(
+            f'<div class="qa-body"><div class="qa-ico">{_ico(icon_name, 26)}</div>'
+            f'<div class="qa-txt"><div class="qa-t">{esc(title)}</div><div class="qa-d">{esc(desc)}</div></div>'
+            f'<div class="qa-go">→</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.button(title, key=key, on_click=goto, args=(page, match_tab), use_container_width=True)
+
+
+def bar_html(pct):
+    return f'<div class="bar" style="height:6px;background:#F1F3F2;border-radius:99px;overflow:hidden"><div style="width:{max(0, min(100, pct))}%;height:100%;background:#10B981;border-radius:99px"></div></div>'
+
+
+def flash(kind, msg):
+    st.session_state["flash"] = (kind, msg)
+
+
+def show_flash():
+    f = st.session_state.pop("flash", None)
+    if f:
+        kind, msg = f
+        {"success": st.success, "error": st.error, "warning": st.warning}.get(kind, st.info)(msg)
+
+
+def empty_state():
+    st.info("Henüz öğrenci listesi yüklenmemiş. Genel Bakış sayfasından veya Yönetici Paneli'nden Excel/CSV yükleyebilirsiniz.")
+
+
+def student_labels(df):
+    return {int(r.id): f"{r.ad_soyad}  ·  {r.sinif}-{r.sube}" for r in df.itertuples()}
+
+
+def class_branch_filter(df, key):
+    c1, c2 = st.columns(2)
+    siniflar = ["Tümü"] + sorted(int(x) for x in df.sinif.unique())
+    sel_s = c1.selectbox(
+        "Sınıf", siniflar, key=f"{key}_sinif",
+        format_func=lambda x: x if x == "Tümü" else f"{x}. Sınıf",
+    )
+    base = df if sel_s == "Tümü" else df[df.sinif == sel_s]
+    subeler = ["Tümü"] + sorted(base.sube.unique().tolist(), key=tr_key)
+    sel_b = c2.selectbox("Şube", sub

@@ -891,4 +891,371 @@ def build_progress_records(raw, cols, mapping):
     records = [{"student_id": s, "game_id": g, **d} for (s, g), d in recs.items()]
     return records, {
         "matched": len(final), "unmatched": unmatched, "dup": dup, "blank": blank,
-        "
+        "archived": len([s for s in final if s in arch]), "info": info,
+        "ts_max": (ts.max().date() if ts is not None and ts.notna().any() else None),
+    }
+
+
+def progress_template_xlsx():
+    games = load_games()
+    indiv = games[games.kategori == INDIV_CATEGORY].ad.tolist()
+    example = pd.DataFrame(
+        [["OG0001", "Örnek Öğrenci 1"] + [20 + 5 * i for i in range(len(indiv))],
+         ["OG0002", "Örnek Öğrenci 2"] + [10 + 3 * i for i in range(len(indiv))]],
+        columns=["Ogrenci_ID", "Ad_Soyad"] + indiv,
+    )
+    help_df = pd.DataFrame({"Açıklama": [
+        "Ogrenci_ID sütunu zorunludur. Ad_Soyad isteğe bağlıdır.",
+        "Her oyun ayrı bir sütundur.",
+    ]})
+    return to_xlsx_bytes({"Geçiş Verisi": example, "Açıklama": help_df})
+
+
+# ---- Toplu oyunlar: grup / turnuva / skor ----------------------------------------
+def _clean(s):
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def _as_date(tarih):
+    if tarih is None:
+        return date.today()
+    if isinstance(tarih, datetime):
+        return tarih.date()
+    return tarih if isinstance(tarih, date) else None
+
+
+def create_group(ad, game_id, turnuva, member_ids, tarih=None):
+    ad, turnuva = _clean(ad), _clean(turnuva)
+    if game_id is None:
+        return False, "Lütfen bir toplu oyun seçin."
+    if not ad:
+        return False, "Grup adı boş bırakılamaz."
+    member_ids = sorted({int(i) for i in (member_ids or [])})
+    if not member_ids:
+        return False, "Gruba en az bir oyuncu ekleyin."
+    tarih = _as_date(tarih)
+    if tarih is None or tarih > date.today():
+        return False, "Geçerli bir tarih seçin."
+    try:
+        with db() as c:
+            kat = c.execute("SELECT kategori FROM games WHERE id=?", (int(game_id),)).fetchone()
+            if not kat or kat["kategori"] != GROUP_CATEGORY:
+                return False, "Gruplar yalnızca toplu oyunlar için oluşturulabilir."
+            cur = c.execute(
+                "INSERT INTO game_groups (ad, game_id, turnuva, tarih) VALUES (?,?,?,?)",
+                (ad, int(game_id), turnuva, tarih.strftime("%Y-%m-%d")),
+            )
+            c.executemany(
+                "INSERT OR IGNORE INTO group_members (group_id, student_id) VALUES (?,?)",
+                [(cur.lastrowid, i) for i in member_ids],
+            )
+        return True, f"'{ad}' grubu {len(member_ids)} oyuncu ile oluşturuldu."
+    except sqlite3.IntegrityError:
+        return False, "Bu oyunda, aynı turnuva altında bu isimde bir grup zaten var."
+
+
+def update_group(gid, ad, turnuva, member_ids):
+    ad, turnuva = _clean(ad), _clean(turnuva)
+    if not ad:
+        return False, "Grup adı boş bırakılamaz."
+    want = {int(i) for i in (member_ids or [])}
+    try:
+        with db() as c:
+            c.execute("UPDATE game_groups SET ad=?, turnuva=? WHERE id=?", (ad, turnuva, int(gid)))
+            current = {r[0] for r in c.execute("SELECT student_id FROM group_members WHERE group_id=?", (int(gid),))}
+            active = {r[0] for r in c.execute(
+                "SELECT s.id FROM group_members gm JOIN students s ON s.id=gm.student_id "
+                "WHERE gm.group_id=? AND s.arsiv=0", (int(gid),))}
+            c.executemany("DELETE FROM group_members WHERE group_id=? AND student_id=?",
+                          [(int(gid), i) for i in active - want])
+            c.executemany("INSERT OR IGNORE INTO group_members (group_id, student_id) VALUES (?,?)",
+                          [(int(gid), i) for i in want - current])
+        return True, "Grup güncellendi."
+    except sqlite3.IntegrityError:
+        return False, "Bu oyunda, aynı turnuva altında bu isimde başka bir grup zaten var."
+
+
+def delete_group(gid):
+    require_admin()
+    with db() as c:
+        c.execute("DELETE FROM game_groups WHERE id=?", (int(gid),))
+
+
+def load_groups():
+    with db() as c:
+        return pd.read_sql_query(
+            "SELECT gg.id AS id, gg.ad AS ad, gg.turnuva AS turnuva, gg.tarih AS tarih, gg.game_id AS game_id, "
+            "g.ad AS oyun, "
+            "(SELECT COUNT(*) FROM group_members gm JOIN students s ON s.id=gm.student_id "
+            " WHERE gm.group_id=gg.id AND s.arsiv=0) AS uye "
+            "FROM game_groups gg JOIN games g ON g.id=gg.game_id ORDER BY gg.tarih DESC, gg.id DESC", c)
+
+
+def group_label(r):
+    return f"{r.oyun} · " + (f"{r.turnuva} · " if r.turnuva else "") + f"{r.ad}"
+
+
+def group_members_df(gid):
+    with db() as c:
+        df = pd.read_sql_query(
+            "SELECT s.id AS id, s.ogrenci_no AS ogrenci_no, s.ad_soyad AS ad_soyad, s.sinif AS sinif, s.sube AS sube "
+            "FROM group_members gm JOIN students s ON s.id=gm.student_id "
+            "WHERE gm.group_id=? AND s.arsiv=0", c, params=[int(gid)])
+    return _sort_students(df)
+
+
+def save_group_scores(gid, rows, tarih=None, tur=""):
+    tarih = _as_date(tarih)
+    if tarih is None or tarih > date.today():
+        return False, "Geçerli bir tarih seçin."
+    clean = []
+    for sid, kart, puan in rows:
+        k, p = _to_int(kart), _to_int(puan)
+        if k is None and p is None:
+            continue
+        if (k or 0) < 0 or (p or 0) < 0:
+            return False, "Kart ve puan negatif olamaz."
+        clean.append((int(sid), k or 0, p or 0))
+    if not clean:
+        return False, "Kaydedilecek skor girilmedi."
+    with db() as c:
+        members = {r[0] for r in c.execute("SELECT student_id FROM group_members WHERE group_id=?", (int(gid),))}
+        if any(s not in members for s, _, _ in clean):
+            return False, "Skor girilen oyunculardan biri bu grubun üyesi değil."
+        c.executemany(
+            "INSERT INTO group_scores (group_id, student_id, tarih, tur, kart, puan) VALUES (?,?,?,?,?,?)",
+            [(int(gid), s, tarih.strftime("%Y-%m-%d"), _clean(tur), k, p) for s, k, p in clean],
+        )
+    return True, f"{len(clean)} oyuncunun skoru kaydedildi."
+
+
+def delete_group_score(sid):
+    require_admin()
+    with db() as c:
+        c.execute("DELETE FROM group_scores WHERE id=?", (int(sid),))
+
+
+def group_scores_df():
+    with db() as c:
+        return pd.read_sql_query(
+            "SELECT sc.id AS id, sc.tarih AS tarih, sc.tur AS tur, sc.kart AS kart, sc.puan AS puan, "
+            "sc.student_id AS student_id, sc.group_id AS group_id, gg.ad AS grup, gg.turnuva AS turnuva, "
+            "gg.game_id AS game_id, g.ad AS oyun, s.ad_soyad AS ad_soyad, s.sinif AS sinif, s.sube AS sube, "
+            "s.arsiv AS arsiv "
+            "FROM group_scores sc JOIN game_groups gg ON gg.id=sc.group_id JOIN games g ON g.id=gg.game_id "
+            "JOIN students s ON s.id=sc.student_id ORDER BY sc.tarih DESC, sc.id DESC", c)
+
+
+def player_standings(sc, key="puan"):
+    cols = ["Sıra", "Ad Soyad", "Sınıf", "Şube", "Kayıt", "Kart", "Puan"]
+    if sc.empty:
+        return pd.DataFrame(columns=cols)
+    g = sc.groupby(["student_id", "ad_soyad", "sinif", "sube"], as_index=False).agg(
+        kayit=("id", "count"), kart=("kart", "sum"), puan=("puan", "sum"))
+    other = "kart" if key == "puan" else "puan"
+    g = g.sort_values([key, other, "ad_soyad"], ascending=[False, False, True]).reset_index(drop=True)
+    g.insert(0, "Sıra", range(1, len(g) + 1))
+    return g.rename(columns={"ad_soyad": "Ad Soyad", "sinif": "Sınıf", "sube": "Şube", "kayit": "Kayıt",
+                             "kart": "Kart", "puan": "Puan"})[cols]
+
+
+def group_totals(sc, key="puan"):
+    cols = ["Sıra", "Oyun", "Turnuva", "Grup", "Oyuncu", "Kart", "Puan"]
+    if sc.empty:
+        return pd.DataFrame(columns=cols)
+    g = sc.groupby(["group_id", "oyun", "turnuva", "grup"], as_index=False).agg(
+        oyuncu=("student_id", "nunique"), kart=("kart", "sum"), puan=("puan", "sum"))
+    other = "kart" if key == "puan" else "puan"
+    g = g.sort_values([key, other], ascending=False).reset_index(drop=True)
+    g.insert(0, "Sıra", range(1, len(g) + 1))
+    g["turnuva"] = g.turnuva.replace("", "—")
+    return g.rename(columns={"oyun": "Oyun", "turnuva": "Turnuva", "grup": "Grup", "oyuncu": "Oyuncu",
+                             "kart": "Kart", "puan": "Puan"})[cols]
+
+
+# ---- İstatistikler ---------------------------------------------------------
+def compute_stats(students, matches):
+    df = students.copy()
+    cols = ["galibiyet", "beraberlik", "maglubiyet"]
+    if matches.empty:
+        for c in cols:
+            df[c] = 0
+    else:
+        a = pd.DataFrame({
+            "id": matches.p1_id,
+            "galibiyet": (matches.sonuc == "1").astype(int),
+            "beraberlik": (matches.sonuc == "D").astype(int),
+            "maglubiyet": (matches.sonuc == "2").astype(int),
+        })
+        b = pd.DataFrame({
+            "id": matches.p2_id,
+            "galibiyet": (matches.sonuc == "2").astype(int),
+            "beraberlik": (matches.sonuc == "D").astype(int),
+            "maglubiyet": (matches.sonuc == "1").astype(int),
+        })
+        agg = pd.concat([a, b]).groupby("id", as_index=False).sum()
+        df = df.merge(agg, on="id", how="left")
+        df[cols] = df[cols].fillna(0).astype(int)
+    df["mac"] = df[cols].sum(axis=1)
+    df["puan"] = df.galibiyet * 3 + df.beraberlik
+    df["basari"] = ((df.galibiyet + 0.5 * df.beraberlik) / df.mac.where(df.mac > 0) * 100).fillna(0).round(1)
+    df["seviye"] = ((df.galibiyet + 0.5 * df.beraberlik + 1) / (df.mac + 2)).round(3)
+    return df
+
+
+def branch_summary(stats):
+    if stats.empty:
+        return pd.DataFrame(columns=["sinif", "sube", "mevcut", "aktif", "galibiyet", "beraberlik", "mac", "basari"])
+    g = (
+        stats.groupby(["sinif", "sube"])
+        .agg(
+            mevcut=("id", "count"),
+            aktif=("mac", lambda s: int((s > 0).sum())),
+            galibiyet=("galibiyet", "sum"),
+            beraberlik=("beraberlik", "sum"),
+            mac=("mac", "sum"),
+        )
+        .reset_index()
+    )
+    g["basari"] = ((g.galibiyet + 0.5 * g.beraberlik) / g.mac.where(g.mac > 0) * 100).fillna(0).round(1)
+    return g.sort_values(["sinif", "sube"]).reset_index(drop=True)
+
+
+def auto_pair(ids, rating, already):
+    ordered = sorted(ids, key=lambda i: (-rating[i], i))
+    pairs, remaining = [], list(ordered)
+    while len(remaining) >= 2:
+        a = remaining.pop(0)
+        best = min(
+            range(len(remaining)),
+            key=lambda k: (frozenset((a, remaining[k])) in already, abs(rating[a] - rating[remaining[k]]), k),
+        )
+        b = remaining.pop(best)
+        pairs.append((a, b))
+    return pairs, remaining
+
+
+# ----------------------------------------------------------------------------
+# İKONLAR
+# ----------------------------------------------------------------------------
+_ICON_PATHS = {
+    "home": '<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>',
+    "school": '<path d="M2 10l10-5 10 5-10 5z"/><path d="M6 12v5c3 2 9 2 12 0v-5"/>',
+    "swords": '<path d="M14 4l6-1-1 6-9 9-4-4z"/><path d="M5 15l-2 2 4 4 2-2"/>',
+    "trophy": '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0z"/><path d="M7 6H4v2a3 3 0 0 0 3 3M17 6h3v2a3 3 0 0 1-3 3"/>',
+    "dice": '<rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9" cy="9" r="1"/><circle cx="15" cy="15" r="1"/><circle cx="15" cy="9" r="1"/><circle cx="9" cy="15" r="1"/>',
+    "lock": '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+    "users": '<circle cx="9" cy="8" r="3"/><path d="M3 20c0-3 3-5 6-5s6 2 6 5"/><path d="M16 5a3 3 0 0 1 0 6M18 15c2 .5 3 2.2 3 4"/>',
+    "chart": '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+    "scale": '<path d="M12 3v18M5 21h14M5 7h14"/><path d="M5 7l-3 7a3 3 0 0 0 6 0zM19 7l-3 7a3 3 0 0 0 6 0z"/>',
+    "target": '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/>',
+    "puzzle": '<path d="M10 4a2 2 0 1 1 4 0v2h4v4h-2a2 2 0 1 0 0 4h2v6H4v-6h2a2 2 0 1 0 0-4H4V6h6z"/>',
+    "brain": '<path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 2 5 3 3 0 0 0 6 1V4a3 3 0 0 0-3 0zM15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-2 5 3 3 0 0 1-6 1"/>',
+    "archive": '<rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11h14V8M10 12h4"/>',
+    "calendar": '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+}
+
+_EMOJI_TO_ICON = {
+    "⚔️": "swords", "⚖️": "scale", "👩‍🎓": "users", "📈": "chart", "🏫": "school", "🏆": "trophy",
+    "🎲": "dice", "🔐": "lock", "👥": "users", "🎯": "target", "📊": "chart", "🧠": "brain", "🧩": "puzzle",
+}
+
+
+def icon(name, size=22):
+    return (
+        f'<svg width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        f'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+        f'{_ICON_PATHS[name]}</svg>'
+    )
+
+
+def _ico(x, size=22):
+    name = _EMOJI_TO_ICON.get(x, x)
+    return icon(name, size) if name in _ICON_PATHS else x
+
+
+# ----------------------------------------------------------------------------
+# TASARIM (Clean Light & Modern Dark Hero Mix)
+# ----------------------------------------------------------------------------
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Nunito:wght@400;600;700;800&display=swap');
+:root{
+  --bg:#F9F9F8; --card:#FFFFFF; --line:#EAEAEA; --milk:#F1F3F2; --latte:#E2E5E4;
+  --side:#1E232A; --side-hi:#282E37;
+  --taba:#10B981; --taba-d:#059669; --mocha:#374151; --espresso:#111827; --muted:#6B7280;
+  --shadow:0 2px 8px rgba(0,0,0,.04); --shadow-h:0 8px 20px rgba(0,0,0,.08);
+}
+html, body, .stApp{font-family:'Nunito',system-ui,-apple-system,'Segoe UI',sans-serif;}
+.stApp{background:var(--bg);color:var(--espresso);}
+.stApp p, .stApp label, .stApp li, .stApp span, .stApp div[data-testid="stMarkdownContainer"]{color:var(--espresso);}
+header[data-testid="stHeader"]{background:transparent;}
+.block-container{padding-top:1.5rem;max-width:1200px;}
+h1,h2,h3,h4{font-family:'DM Serif Display',Georgia,serif !important;color:var(--espresso) !important;letter-spacing:.2px;}
+hr{border-color:var(--line);}
+
+/* ============ LANDING PAGE HERO (Koyu / Modern SaaS Stili) ============ */
+.hero-landing {
+  background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%);
+  border-radius: 20px;
+  padding: 3.5rem 2.5rem;
+  color: #FFFFFF;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.15);
+  margin-bottom: 2rem;
+}
+.hero-landing h1 {
+  color: #FFFFFF !important;
+  font-size: 3.2rem !important;
+  line-height: 1.15;
+  margin-bottom: 1rem;
+}
+.hero-landing p {
+  color: #94A3B8 !important;
+  font-size: 1.25rem;
+  max-width: 700px;
+  margin: 0 auto 2rem auto;
+}
+.badge-saas {
+  display: inline-block;
+  background: rgba(16, 185, 129, 0.15);
+  color: #10B981;
+  padding: 0.4rem 1rem;
+  border-radius: 99px;
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  margin-bottom: 1.2rem;
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+/* ============ SIDEBAR ============ */
+section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div{background:var(--side) !important;}
+section[data-testid="stSidebar"]{border-right:none;}
+section[data-testid="stSidebar"] .block-container{padding-top:1.5rem;}
+section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] div{color:#E5E7EB;}
+[data-testid="stSidebarCollapseButton"] button, [data-testid="stSidebarCollapseButton"] span,
+[data-testid="stSidebarCollapseButton"] svg{color:#E5E7EB !important;fill:#E5E7EB !important;}
+.brand{display:flex;align-items:center;gap:.8rem;padding:.2rem .3rem 1.2rem .3rem;margin-bottom:.9rem;border-bottom:1px solid rgba(255,255,255,.10);}
+.brand-logo{width:44px;height:44px;border-radius:12px;background:linear-gradient(135deg,#10B981,#059669);display:flex;align-items:center;justify-content:center;font-size:1.45rem;box-shadow:0 6px 14px rgba(0,0,0,.28);}
+section[data-testid="stSidebar"] .brand-t{font-family:'DM Serif Display',Georgia,serif;font-size:1.1rem;line-height:1.15;color:#F9FAFB;}
+section[data-testid="stSidebar"] .brand-s{font-size:.7rem;color:#9CA3AF;letter-spacing:.1em;text-transform:uppercase;margin-top:3px;}
+section[data-testid="stSidebar"] .side-label{font-size:.68rem;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#9CA3AF;margin:0 0 .5rem .4rem;}
+section[data-testid="stSidebar"] div[role="radiogroup"]{display:flex;flex-direction:column;gap:.3rem;}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label{background:transparent;border:1px solid transparent;border-radius:10px;padding:.65rem .9rem;width:100%;cursor:pointer;transition:background .2s ease, transform .2s ease;}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:hover{background:rgba(255,255,255,.07);transform:translateX(3px);}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked){background:linear-gradient(135deg,#10B981 0%,#059669 100%);box-shadow:0 6px 14px rgba(0,0,0,.25);}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label > div:first-child{display:none;}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label p{font-weight:700;font-size:.96rem;margin:0;color:#E5E7EB;}
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) p,
+section[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) div{color:#FFFFFF !important;}
+section[data-testid="stSidebar"] .side-note{margin-top:1.4rem;padding:.75rem .95rem;border-radius:10px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);font-size:.8rem;color:#D1D5DB;}
+
+/* ============ BANNER & METRİKLER ============ */
+.welcome{position:relative;overflow:hidden;display:flex;align-items:center;justify-content:space-between;gap:1.2rem;padding:2rem 2.2rem;margin-bottom:1.3rem;border-radius:16px;background:#FFFFFF;border:1px solid var(--line);box-shadow:var(--shadow);}
+.welcome-t{font-family:'DM Serif Display',Georgia,serif;font-size:2.15rem;line-height:1.15;color:var(--espresso);}
+.welcome-s{
